@@ -1,0 +1,4 @@
+sku,product_name,category,quantity,unit_price,currency,reorder_level
+SKU-3001,Notebook,Stationery,125,4.50,USD,25
+SKU-3002,Desk Lamp,Office,18,29.99,USD,10
+SKU-3003,Water Bottle,Accessories,42,15.00,USD,12

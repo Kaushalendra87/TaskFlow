@@ -1,0 +1,4 @@
+customer_id,first_name,last_name,email,phone,city,country
+C-2001,Avery,Chen,avery.chen@example.com,+1-555-0101,Portland,US
+C-2002,Noah,Patel,noah.patel@example.com,+1-555-0102,Austin,US
+C-2003,Mia,Garcia,mia.garcia@example.com,+1-555-0103,Denver,US

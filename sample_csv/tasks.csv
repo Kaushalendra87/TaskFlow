@@ -1,0 +1,4 @@
+task_id,title,description,status,priority,due_date,assignee
+TASK-1001,Prepare weekly report,Compile the weekly operations summary,open,high,2026-11-02,alex@example.com
+TASK-1002,Review customer feedback,Group feedback by product area,in_progress,medium,2026-11-04,jamie@example.com
+TASK-1003,Update help center,Refresh setup instructions,open,low,2026-11-08,sam@example.com

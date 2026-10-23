@@ -1,0 +1,48 @@
+# Environment files and credentials. Keep sanitized templates in version control.
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.*.example
+
+# Python environments, bytecode, and test/build output.
+**/.venv/
+**/venv/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Node dependencies and generated frontend output.
+**/node_modules/
+**/dist/
+**/build/
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+frontend/next.config.js
+
+# Local databases, uploaded files, static assets, logs, and service state.
+*.sqlite3
+*.db
+*.rdb
+backend/media/
+backend/staticfiles/
+backend/celerybeat-schedule*
+*.log
+*.pem
+*.p12
+*.pfx
+*.key
+
+# Local editor/tooling and project notes.
+.kilo/
+/context.md
+/report.md
+.DS_Store
+Thumbs.db

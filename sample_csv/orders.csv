@@ -1,0 +1,4 @@
+order_id,customer_id,order_date,product_sku,quantity,unit_price,currency,order_status
+ORD-4001,C-2001,2026-10-20,SKU-3001,3,4.50,USD,paid
+ORD-4002,C-2002,2026-10-21,SKU-3002,1,29.99,USD,processing
+ORD-4003,C-2003,2026-10-22,SKU-3003,2,15.00,USD,shipped
