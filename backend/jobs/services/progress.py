@@ -9,6 +9,10 @@ from jobs.services.realtime_updates import publish_job_update, build_job_update,
 logger = logging.getLogger(__name__)
 
 
+class JobAlreadyTerminalError(Exception):
+    """Raised when a progress update attempts to change a terminal job."""
+
+
 def update_job_progress(
     job,
     *,
@@ -65,6 +69,22 @@ def update_job_progress(
         # Lock the database row to prevent concurrent progress updates
         # from assigning the same next sequence number.
         locked_job = Job.objects.select_for_update().get(pk=job.pk)
+
+        terminal_statuses = {
+            Job.Status.COMPLETED,
+            Job.Status.FAILED,
+            Job.Status.CANCELLED,
+        }
+        if (
+            locked_job.status in terminal_statuses
+            and (
+                status != locked_job.status
+                or event != locked_job.status
+            )
+        ):
+            raise JobAlreadyTerminalError(
+                f"Job {locked_job.pk} is already {locked_job.status}."
+            )
 
         locked_job.progress = progress
 

@@ -9,7 +9,7 @@ from jobs.models import JobEvent
 from jobs.services.event_history import record_job_event
 from jobs.services.progress import update_job_progress
 from .models import Job, DailyJobSummary
-from .services.job_processor import process_job
+from .services.job_processor import mark_job_cancelled, process_job
 from .services.realtime import send_job_update
 
 
@@ -26,12 +26,28 @@ def process_job_task(self, job_id):
         return process_job(job_id)
 
     except Exception as exc:
+        try:
+            job = Job.objects.get(id=job_id)
+        except Job.DoesNotExist:
+            logger.info("Skipping task for deleted job %s", job_id)
+            return None
+
+        if job.cancel_requested or job.status == Job.Status.CANCELLED:
+            return mark_job_cancelled(job)
+
+        if job.status in {
+            Job.Status.COMPLETED,
+            Job.Status.FAILED,
+        }:
+            logger.info(
+                "Not retrying task for terminal job %s (%s)",
+                job_id,
+                job.status,
+            )
+            return job
 
         if self.request.retries >= self.max_retries:
 
-            job = Job.objects.get(
-                id=job_id
-            )
             job.status = Job.Status.FAILED
             job.error_message = str(exc)
 
@@ -66,10 +82,6 @@ def process_job_task(self, job_id):
             send_job_update(job)
 
             raise
-
-        job = Job.objects.get(
-            id=job_id
-        )
 
         job.status = Job.Status.RETRYING
         job.error_message = (

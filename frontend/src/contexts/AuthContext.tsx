@@ -29,14 +29,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   useEffect(() => {
-    hydrate();
-    const { accessToken } = useAuthStore.getState();
-    if (accessToken && !user) {
-      refreshUser().finally(() => setIsLoading(false));
-    } else {
-      setIsLoading(false);
-    }
-  }, [hydrate, refreshUser, user]);
+    let isMounted = true;
+    void hydrate().finally(() => {
+      if (isMounted) {
+        setIsLoading(false);
+      }
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [hydrate]);
 
   const login = useCallback(async (email: string, password: string) => {
     setIsLoading(true);
@@ -62,8 +65,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const logout = useCallback(async () => {
-    api.logout();
+    const logoutRequest = api.logout();
     logoutStore();
+    await logoutRequest;
   }, [logoutStore]);
 
   const value: AuthContextValue = {

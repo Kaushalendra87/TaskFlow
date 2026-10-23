@@ -1,10 +1,9 @@
-import csv
-import time
-
+from django.db import transaction
 from django.utils import timezone
 
 from jobs.models import Job, JobEvent
 from jobs.services.event_history import record_job_event
+from jobs.services.csv_processing import iter_csv_rows
 from jobs.services.progress import update_job_progress
 from jobs.services.realtime import send_job_update
 
@@ -14,55 +13,57 @@ PROGRESS_UPDATE_INTERVAL = 5
 
 def count_csv_rows(job):
     """Count CSV data rows without loading all rows into memory."""
-    job.file.open("r")
+    job.file.open("rb")
 
     try:
-        reader = csv.DictReader(job.file)
-        return sum(1 for _ in reader)
+        return sum(1 for _ in iter_csv_rows(job.file))
     finally:
         job.file.close()
-
-
-def process_csv_row(row):
-    """
-    Simulate processing one CSV row.
-
-    Replace this with actual business logic later.
-    """
-    time.sleep(1)
 
 
 def cancellation_requested(job):
     """
     Read the latest cancellation flag from the database.
     """
-    job.refresh_from_db(fields=["cancel_requested"])
-    return job.cancel_requested
+    job.refresh_from_db(fields=["cancel_requested", "status"])
+    return job.cancel_requested or job.status == Job.Status.CANCELLED
 
 
 def mark_job_cancelled(job):
     """Persist cancellation and notify connected WebSocket clients."""
-    job.status = Job.Status.CANCELLED
-    job.save(update_fields=["status"])
+    with transaction.atomic():
+        job = Job.objects.select_for_update().get(pk=job.pk)
+        if job.status == Job.Status.CANCELLED:
+            return job
 
-    record_job_event(
-        job=job,
-        event_type=JobEvent.EventType.CANCELLED,
-        message="Your job was cancelled.",
-        metadata={
-            "status": job.status,
-        },
-    )
+        if job.status in {
+            Job.Status.COMPLETED,
+            Job.Status.FAILED,
+        }:
+            return job
 
-    update_job_progress(
-        job,
-        progress=job.progress,
-        status=Job.Status.CANCELLED,
-        event="cancelled",
-        message="Job was cancelled.",
-    )
+        job.cancel_requested = True
+        job.status = Job.Status.CANCELLED
+        job.save(update_fields=["cancel_requested", "status", "updated_at"])
 
-    send_job_update(job)
+        record_job_event(
+            job=job,
+            event_type=JobEvent.EventType.CANCELLED,
+            message="Your job was cancelled.",
+            metadata={
+                "status": job.status,
+            },
+        )
+
+        update_job_progress(
+            job,
+            progress=job.progress,
+            status=Job.Status.CANCELLED,
+            event="cancelled",
+            message="Job was cancelled.",
+        )
+
+    transaction.on_commit(lambda: send_job_update(job))
 
     return job
 
@@ -132,22 +133,13 @@ def process_job(job_id):
 
     next_progress_update = PROGRESS_UPDATE_INTERVAL
 
-    job.file.open("r")
+    job.file.open("rb")
 
     try:
-        reader = csv.DictReader(job.file)
-
-        for index, row in enumerate(reader, start=1):
+        for index, _row in enumerate(iter_csv_rows(job.file), start=1):
 
             # Stop before processing the next row if cancellation
             # was requested.
-            if cancellation_requested(job):
-                return mark_job_cancelled(job)
-
-            process_csv_row(row)
-
-            # A cancellation may have been requested while the
-            # current row was being processed.
             if cancellation_requested(job):
                 return mark_job_cancelled(job)
 

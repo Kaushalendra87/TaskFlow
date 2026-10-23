@@ -83,7 +83,7 @@ export function JobDetailPage() {
     setCancelLoading(true);
     try {
       await api.cancelJob(parseInt(id));
-      toast.success('Cancellation requested');
+      toast.success('Job cancelled');
       fetchJob();
     } catch (err: any) {
       toast.error(err.message || 'Failed to cancel job');

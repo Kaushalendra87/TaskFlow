@@ -99,7 +99,7 @@ export function JobProvider({ children }: { children: React.ReactNode }) {
     try {
       await api.deleteJob(id);
       useJobStore.getState().removeJob(id);
-      toast.success('Completed job deleted');
+      toast.success('Job deleted');
     } catch (err: any) {
       toast.error(err.message || 'Failed to delete job');
     }
@@ -109,7 +109,7 @@ export function JobProvider({ children }: { children: React.ReactNode }) {
     try {
       const job = await api.cancelJob(id);
       useJobStore.getState().updateJob(id, job);
-      toast.success('Job cancellation requested');
+      toast.success(job.status === 'cancelled' ? 'Job cancelled' : 'Job cancellation requested');
     } catch (err: any) {
       toast.error(err.message || 'Failed to cancel job');
     }

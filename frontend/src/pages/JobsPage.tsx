@@ -61,16 +61,16 @@ export function JobsPage() {
                     </Badge>
                   </div>
                 </Link>
-                {job.status === 'completed' && (
+                {['completed', 'failed', 'cancelled'].includes(job.status) && (
                   <Button
                     variant="ghost"
                     size="icon"
                     className="shrink-0 text-destructive hover:text-destructive"
-                    aria-label={`Delete completed job ${job.id}`}
-                    title="Delete completed job"
+                    aria-label={`Delete ${job.status} job ${job.id}`}
+                    title={`Delete ${job.status} job`}
                     loading={deletingJobId === job.id}
                     onClick={async () => {
-                      if (!window.confirm('Delete this completed job and its uploaded CSV? This also removes its job history and notifications.')) {
+                      if (!window.confirm(`Delete this ${job.status} job and its uploaded CSV? This also removes its job history and notifications.`)) {
                         return;
                       }
                       setDeletingJobId(job.id);

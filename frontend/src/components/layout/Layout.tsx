@@ -4,10 +4,11 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useUIStore } from '@/store';
 import { Button } from '@/components/ui/Button';
 import { Avatar, AvatarFallback } from '@/components/ui/Avatar';
-import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuLabel } from '@/components/ui/DropdownMenu';
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel } from '@/components/ui/DropdownMenu';
 import { Menu, X, LogOut, User, Settings, BarChart3, FolderOpen, Moon, Sun } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { NotificationBell } from '@/components/NotificationBell';
+import toast from 'react-hot-toast';
 
 export function Layout() {
   const { user, logout, isLoading: authLoading } = useAuth();
@@ -17,6 +18,16 @@ export function Layout() {
   const isDarkMode = theme === 'dark' || (
     theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches
   );
+
+  const handleLogout = () => {
+    const logoutRequest = logout();
+    navigate('/login', { replace: true });
+    toast.success('You have been logged out');
+    void logoutRequest.catch((error: unknown) => {
+      console.error('Failed to invalidate server session:', error);
+      toast.error('You are logged out here, but the server session could not be ended.');
+    });
+  };
 
   useEffect(() => {
     initializeTheme();
@@ -110,13 +121,17 @@ export function Layout() {
                   <User className="mr-2 h-4 w-4" />
                   Profile
                 </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={logout} className="text-destructive focus:text-destructive">
-                  <LogOut className="mr-2 h-4 w-4" />
-                  Log out
-                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
+            <Button
+              variant="ghost"
+              className="w-full justify-start mt-1 text-destructive hover:text-destructive"
+              size="sm"
+              onClick={handleLogout}
+            >
+              <LogOut className="mr-2 h-4 w-4" />
+              Log out
+            </Button>
           </div>
         </div>
       </aside>

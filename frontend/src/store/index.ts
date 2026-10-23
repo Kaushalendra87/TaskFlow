@@ -16,7 +16,7 @@ interface AuthState {
   hydrate: () => Promise<void>;
 }
 
-export const useAuthStore = create<AuthState>((set) => ({
+export const useAuthStore = create<AuthState>((set, get) => ({
   user: null, accessToken: null, refreshToken: null, isAuthenticated: false,
   setAuth: (user, access, refresh) => {
     set({ user, accessToken: access, refreshToken: refresh, isAuthenticated: true });
@@ -36,6 +36,12 @@ export const useAuthStore = create<AuthState>((set) => ({
         const data = JSON.parse(saved);
         if (data.accessToken && data.user) {
           const user = await api.me();
+          if (
+            get().accessToken !== data.accessToken ||
+            !get().isAuthenticated
+          ) {
+            return;
+          }
           set({ user, accessToken: data.accessToken, refreshToken: data.refreshToken, isAuthenticated: true });
         }
       }

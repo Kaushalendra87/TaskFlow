@@ -8,6 +8,7 @@ from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
+from kombu.exceptions import OperationalError
 
 from rest_framework import status
 from rest_framework.test import APITestCase, APIClient
@@ -19,8 +20,9 @@ from jobs.models import (
     JobProgressEvent,
     Notification,
 )
+from jobs.services.csv_processing import CSVValidationError, iter_csv_rows
 from jobs.services.job_processor import process_job
-from jobs.services.progress import update_job_progress
+from jobs.services.progress import JobAlreadyTerminalError, update_job_progress
 from jobs.tasks import process_job_task
 
 
@@ -68,20 +70,19 @@ class JobProcessingTest(TransactionTestCase):
         """Run process_job, returning the (status, progress) updates published."""
         published = []
 
-        with patch("jobs.services.job_processor.time.sleep", new=lambda *a, **k: None):
+        with patch(
+            "jobs.services.job_processor.send_job_update",
+            new=lambda updated: published.append(
+                (updated.status, updated.progress)
+            ),
+        ):
             with patch(
-                "jobs.services.job_processor.send_job_update",
-                new=lambda updated: published.append(
-                    (updated.status, updated.progress)
+                "jobs.services.realtime_updates._send_job_update",
+                new=lambda user_id, data: published.append(
+                    (data.get("status", "unknown"), data.get("progress", 0))
                 ),
             ):
-                with patch(
-                    "jobs.services.realtime_updates._send_job_update",
-                    new=lambda user_id, data: published.append(
-                        (data.get("status", "unknown"), data.get("progress", 0))
-                    ),
-                ):
-                    processed_job = process_job(job.id)
+                processed_job = process_job(job.id)
 
         return processed_job, published
 
@@ -144,8 +145,9 @@ class JobProcessingTest(TransactionTestCase):
     def test_completed_notification_matches_persisted_full_progress(self):
         job = self.create_job(rows=2)
 
-        with patch("jobs.services.job_processor.time.sleep", new=lambda *a, **k: None):
-            process_job(job.id)
+        with patch("jobs.services.job_processor.send_job_update"):
+            with patch("jobs.services.realtime_updates._send_job_update"):
+                process_job(job.id)
 
         job.refresh_from_db()
         notification = Notification.objects.get(
@@ -164,6 +166,31 @@ class JobProcessingTest(TransactionTestCase):
             with self.subTest(rows=rows):
                 job = self.create_job(rows=rows)
                 self.assertEqual(count_csv_rows(job), rows)
+
+    def test_csv_processing_accepts_utf8_bom_and_crlf(self):
+        job = Job.objects.create(
+            user=self.user,
+            file=SimpleUploadedFile(
+                "international.csv",
+                b"\xef\xbb\xbfname,city\r\nAsha,Kathmandu\r\n",
+                content_type="application/octet-stream",
+            ),
+        )
+
+        processed_job, _published = self.process_and_capture(job)
+
+        self.assertEqual(processed_job.status, Job.Status.COMPLETED)
+        self.assertEqual(processed_job.progress, 100)
+
+    def test_csv_parser_rejects_rows_with_wrong_column_count(self):
+        file_obj = SimpleUploadedFile(
+            "invalid.csv",
+            b"name,city\nAsha,Kathmandu,extra\n",
+            content_type="text/csv",
+        )
+
+        with self.assertRaisesRegex(CSVValidationError, "CSV row 2"):
+            list(iter_csv_rows(file_obj))
 
     def test_failed_attempt_sets_retrying_and_schedules_retry(self):
         job = self.create_job()
@@ -207,6 +234,44 @@ class JobProcessingTest(TransactionTestCase):
         task_context.retry.assert_not_called()
         send_update.assert_called_once()
         self.assertEqual(send_update.call_args.args[0].status, Job.Status.FAILED)
+
+    def test_cancelled_job_is_not_retried_after_processing_error(self):
+        job = self.create_job()
+        job.cancel_requested = True
+        job.save(update_fields=["cancel_requested"])
+        task_context = SimpleNamespace(
+            request=SimpleNamespace(retries=1),
+            max_retries=3,
+            retry=Mock(),
+        )
+
+        with patch("jobs.tasks.process_job", side_effect=RuntimeError("Interrupted")):
+            with patch("jobs.services.job_processor.send_job_update"):
+                self.run_task(task_context, job.id)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, Job.Status.CANCELLED)
+        self.assertFalse(task_context.retry.called)
+        self.assertTrue(
+            JobEvent.objects.filter(
+                job=job,
+                event_type=JobEvent.EventType.CANCELLED,
+            ).exists()
+        )
+
+    def test_deleted_job_task_is_ignored(self):
+        job = self.create_job()
+        job_id = job.id
+        job.delete()
+        task_context = SimpleNamespace(
+            request=SimpleNamespace(retries=1),
+            max_retries=3,
+            retry=Mock(),
+        )
+
+        self.run_task(task_context, job_id)
+
+        task_context.retry.assert_not_called()
 
     def test_api_exposes_current_job_state_and_error(self):
         job = self.create_job()
@@ -263,26 +328,28 @@ class JobCancellationTest(APITestCase):
         return job
 
     def cancel(self, job):
-        return self.client.post(
-            reverse("job-cancel", kwargs={"pk": job.id})
-        )
+        with patch("jobs.services.job_processor.send_job_update"):
+            return self.client.post(
+                reverse("job-cancel", kwargs={"pk": job.id})
+            )
 
     def run_processor_quietly(self, job_id):
-        """Run process_job with no row delay and no real channel publishes."""
-        with patch("jobs.services.job_processor.time.sleep", new=lambda *a, **k: None):
-            with patch("jobs.services.job_processor.send_job_update", new=lambda _j: None):
+        """Run process_job without publishing real channel messages."""
+        with patch("jobs.services.job_processor.send_job_update"):
+            with patch("jobs.services.realtime_updates._send_job_update"):
                 return process_job(job_id)
 
-    def test_cancel_pending_job_sets_flag_only(self):
+    def test_cancel_pending_job_is_cancelled_immediately(self):
         job = self.create_job()
 
         response = self.cancel(job)
 
         job.refresh_from_db()
-        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
-        # The request only flags intent; the worker performs the transition.
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["job"]["status"], Job.Status.CANCELLED)
+        self.assertTrue(response.data["job"]["cancel_requested"])
         self.assertTrue(job.cancel_requested)
-        self.assertEqual(job.status, Job.Status.PENDING)
+        self.assertEqual(job.status, Job.Status.CANCELLED)
 
     def test_queued_job_is_cancelled_when_worker_starts(self):
         job = self.create_job(rows=20)
@@ -297,16 +364,32 @@ class JobCancellationTest(APITestCase):
 
     def test_running_job_stops_at_next_checkpoint(self):
         job = self.create_job(rows=20)
-        job.cancel_requested = True
         job.status = Job.Status.PROCESSING
-        job.progress = 10
-        job.save(update_fields=["cancel_requested", "status", "progress"])
+        job.save(update_fields=["status"])
 
-        self.run_processor_quietly(job.id)
+        iterator_calls = 0
+
+        def rows_with_midrun_cancel(_file):
+            nonlocal iterator_calls
+            iterator_calls += 1
+            if iterator_calls == 1:
+                yield {"col1": "one", "col2": "one"}
+                yield {"col1": "two", "col2": "two"}
+                return
+
+            yield {"col1": "one", "col2": "one"}
+            Job.objects.filter(pk=job.pk).update(cancel_requested=True)
+            yield {"col1": "two", "col2": "two"}
+
+        with patch(
+            "jobs.services.job_processor.iter_csv_rows",
+            side_effect=rows_with_midrun_cancel,
+        ):
+            self.run_processor_quietly(job.id)
 
         job.refresh_from_db()
         self.assertEqual(job.status, Job.Status.CANCELLED)
-        self.assertLess(job.progress, 100)
+        self.assertEqual(job.progress, 50)
 
     def test_terminal_jobs_cannot_be_cancelled(self):
         for terminal in (
@@ -320,7 +403,12 @@ class JobCancellationTest(APITestCase):
                 response = self.cancel(job)
 
                 job.refresh_from_db()
-                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                expected_status = (
+                    status.HTTP_200_OK
+                    if terminal == Job.Status.CANCELLED
+                    else status.HTTP_400_BAD_REQUEST
+                )
+                self.assertEqual(response.status_code, expected_status)
                 self.assertEqual(job.status, terminal)
                 self.assertFalse(job.cancel_requested)
 
@@ -340,27 +428,26 @@ class JobCancellationTest(APITestCase):
 
         statuses = [self.cancel(job).status_code for _ in range(3)]
 
-        self.assertEqual(statuses, [status.HTTP_202_ACCEPTED] * 3)
+        self.assertEqual(statuses, [status.HTTP_200_OK] * 3)
         job.refresh_from_db()
         self.assertTrue(job.cancel_requested)
+        self.assertEqual(job.status, Job.Status.CANCELLED)
 
     def test_cancel_after_worker_finished_is_rejected(self):
         job = self.create_job(rows=2)
-        self.cancel(job)
         self.run_processor_quietly(job.id)
         job.refresh_from_db()
-        self.assertEqual(job.status, Job.Status.CANCELLED)
+        self.assertEqual(job.status, Job.Status.COMPLETED)
 
         response = self.cancel(job)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         job.refresh_from_db()
-        self.assertEqual(job.status, Job.Status.CANCELLED)
+        self.assertEqual(job.status, Job.Status.COMPLETED)
 
     def test_cancelled_status_is_exposed_by_the_api(self):
         job = self.create_job(rows=2)
         self.cancel(job)
-        self.run_processor_quietly(job.id)
 
         response = self.client.get(
             reverse("job-detail", kwargs={"pk": job.id})
@@ -419,6 +506,88 @@ class JobListQueryTest(APITestCase):
 
     def list_jobs(self, **params):
         return self.client.get(reverse("job-list-create"), params)
+
+    def test_csv_upload_accepts_bom_and_queues_processing(self):
+        uploaded_file = SimpleUploadedFile(
+            "customers.CSV",
+            b"\xef\xbb\xbfname,city\r\nAsha,Kathmandu\r\n",
+            content_type="application/octet-stream",
+        )
+        with patch(
+            "jobs.views.process_job_task.delay",
+            return_value=SimpleNamespace(id="celery-task-1"),
+        ) as queue_task:
+            response = self.client.post(
+                reverse("job-list-create"),
+                {"file": uploaded_file},
+                format="multipart",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["status"], Job.Status.PENDING)
+        self.assertTrue(
+            Job.objects.filter(
+                pk=response.data["id"],
+                user=self.user,
+            ).exists()
+        )
+        queue_task.assert_called_once_with(response.data["id"])
+
+    def test_csv_upload_rejects_malformed_records_without_creating_job(self):
+        uploaded_file = SimpleUploadedFile(
+            "invalid.csv",
+            b"name,city\nAsha,Kathmandu,unexpected\n",
+            content_type="text/csv",
+        )
+
+        response = self.client.post(
+            reverse("job-list-create"),
+            {"file": uploaded_file},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("CSV row 2", str(response.data["file"]))
+        self.assertFalse(Job.objects.filter(user=self.user).exists())
+
+    def test_csv_upload_rejects_non_csv_file_names(self):
+        uploaded_file = SimpleUploadedFile(
+            "customers.xlsx",
+            b"not a csv",
+            content_type="application/octet-stream",
+        )
+
+        response = self.client.post(
+            reverse("job-list-create"),
+            {"file": uploaded_file},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(Job.objects.filter(user=self.user).exists())
+
+    def test_csv_upload_reports_unavailable_job_queue(self):
+        uploaded_file = SimpleUploadedFile(
+            "customers.csv",
+            b"name,city\nAsha,Kathmandu\n",
+            content_type="text/csv",
+        )
+        with patch(
+            "jobs.views.process_job_task.delay",
+            side_effect=OperationalError("Redis is unavailable"),
+        ):
+            response = self.client.post(
+                reverse("job-list-create"),
+                {"file": uploaded_file},
+                format="multipart",
+            )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        self.assertEqual(response.data["code"], "job_queue_unavailable")
+        self.assertFalse(Job.objects.filter(user=self.user).exists())
 
     def test_list_is_paginated_with_a_ten_row_default(self):
         for index in range(25):
@@ -560,7 +729,7 @@ class JobListQueryTest(APITestCase):
         self.assertFalse(Notification.objects.filter(pk=notification.pk).exists())
         self.assertFalse(file_storage.exists(file_name))
 
-    def test_non_completed_job_cannot_be_deleted(self):
+    def test_non_terminal_job_cannot_be_deleted(self):
         job = self.create_job(
             name="pending-delete.csv",
             status=Job.Status.PENDING,
@@ -572,6 +741,28 @@ class JobListQueryTest(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue(Job.objects.filter(pk=job.pk).exists())
+
+    def test_failed_and_cancelled_jobs_can_be_deleted(self):
+        for job_status in (Job.Status.FAILED, Job.Status.CANCELLED):
+            with self.subTest(status=job_status):
+                job = self.create_job(
+                    name=f"{job_status}-delete.csv",
+                    status=job_status,
+                )
+                file_name = job.file.name
+                file_storage = job.file.storage
+
+                with self.captureOnCommitCallbacks(execute=True):
+                    response = self.client.delete(
+                        reverse("job-detail", kwargs={"pk": job.id})
+                    )
+
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_204_NO_CONTENT,
+                )
+                self.assertFalse(Job.objects.filter(pk=job.pk).exists())
+                self.assertFalse(file_storage.exists(file_name))
 
     def test_user_cannot_delete_another_users_job(self):
         job = Job.objects.create(
@@ -911,6 +1102,25 @@ class JobProgressHistoryAPITests(APITestCase):
 
         with self.assertRaises(ValueError):
             update_job_progress(job, progress=True)  # bool is not int
+
+    def test_progress_update_cannot_reopen_cancelled_job(self):
+        job = Job.objects.create(
+            user=self.user,
+            file=SimpleUploadedFile(
+                "cancelled.csv",
+                b"col1\nvalue\n",
+                content_type="text/csv",
+            ),
+            status=Job.Status.CANCELLED,
+            cancel_requested=True,
+        )
+
+        with self.assertRaises(JobAlreadyTerminalError):
+            update_job_progress(job, progress=25)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, Job.Status.CANCELLED)
+        self.assertEqual(job.progress, 0)
 
     def test_negative_after_sequence_returns_400(self):
         """Negative after_sequence should return 400."""

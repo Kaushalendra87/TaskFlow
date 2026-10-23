@@ -1,3 +1,5 @@
+import logging
+
 from django.db.models import Q
 from django.db import transaction
 
@@ -8,14 +10,19 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
+from kombu.exceptions import OperationalError
 
 
 from jobs.models import Job, JobEvent
 from jobs.serializers import JobSerializer
 from jobs.tasks import process_job_task
-from jobs.services.realtime import send_job_update
 from jobs.services.event_history import record_job_event
 from jobs.pagination import JobPagination
+from jobs.services.job_processor import mark_job_cancelled
+
+
+logger = logging.getLogger(__name__)
+
 
 class JobListCreateView(APIView):
     permission_classes = [IsAuthenticated]
@@ -133,7 +140,27 @@ class JobListCreateView(APIView):
             },
         )
 
-        task = process_job_task.delay(job.id)
+        try:
+            task = process_job_task.delay(job.id)
+        except OperationalError:
+            logger.exception("Unable to queue CSV job %s", job.pk)
+            file_name = job.file.name
+            file_storage = job.file.storage
+            with transaction.atomic():
+                job.delete()
+                transaction.on_commit(
+                    lambda: file_storage.delete(file_name)
+                )
+            return Response(
+                {
+                    "detail": (
+                        "The job queue is unavailable. Start Redis and the "
+                        "Celery worker, then try uploading again."
+                    ),
+                    "code": "job_queue_unavailable",
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
         job.celery_task_id = task.id
 
@@ -177,11 +204,16 @@ class JobDetailView(APIView):
             pk=pk,
         )
 
-        if job.status != Job.Status.COMPLETED:
+        deletable_statuses = {
+            Job.Status.COMPLETED,
+            Job.Status.FAILED,
+            Job.Status.CANCELLED,
+        }
+        if job.status not in deletable_statuses:
             return Response(
                 {
-                    "detail": "Only completed jobs can be deleted.",
-                    "code": "job_not_completed",
+                    "detail": "Only completed, failed, or cancelled jobs can be deleted.",
+                    "code": "job_not_terminal",
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -200,55 +232,46 @@ class JobCancelView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, pk):
-        #Users can only access their own jobs.
-        job = get_object_or_404(
-            Job,
-            pk = pk,
-            user = request.user,
-        )
-
-        terminal_statuses = [
-            Job.Status.COMPLETED,
-            Job.Status.CANCELLED,
-            Job.Status.FAILED,
-        ]
-
-        #Reject cancellation of jobs that have already ended.
-        if job.status in terminal_statuses:
-            return Response(
-                {
-                    "detail": (
-                        f"Cannot cancel a job with status "
-                        f"'{job.status}'."
-                    ),
-                    "code": "invalid_status_transition",
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+        with transaction.atomic():
+            job = get_object_or_404(
+                Job.objects.select_for_update(),
+                pk=pk,
+                user=request.user,
             )
 
-        #Make repeated requests safe and predictable
-        if job.cancel_requested:
-            return Response(
-                {
-                    "detail": "Cancellation has already been requested.",
-                    "code": "already_cancelled",
-                    "job": JobSerializer(job).data,
-                },
-                status=status.HTTP_202_ACCEPTED,
-            )
+            terminal_statuses = {
+                Job.Status.COMPLETED,
+                Job.Status.CANCELLED,
+                Job.Status.FAILED,
+            }
+            if job.status in terminal_statuses:
+                if job.status == Job.Status.CANCELLED:
+                    return Response(
+                        {
+                            "detail": "Job is already cancelled.",
+                            "code": "already_cancelled",
+                            "job": JobSerializer(job).data,
+                        },
+                        status=status.HTTP_200_OK,
+                    )
+                return Response(
+                    {
+                        "detail": (
+                            f"Cannot cancel a job with status "
+                            f"'{job.status}'."
+                        ),
+                        "code": "invalid_status_transition",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-        #Ask the worker to stop at its next safe checkpoint.
-        job.cancel_requested = True
-        job.save(update_fields=["cancel_requested"])
-
-        #Inform connected Websocket clients.
-        send_job_update(job)
+            job = mark_job_cancelled(job)
 
         return Response(
             {
-                "detail": "Job cancellation requested.",
-                "code": "cancellation_requested",
+                "detail": "Job cancelled.",
+                "code": "cancelled",
                 "job": JobSerializer(job).data,
             },
-            status=status.HTTP_202_ACCEPTED,
+            status=status.HTTP_200_OK,
         )

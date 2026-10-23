@@ -1,7 +1,20 @@
 from rest_framework import serializers
 from .models import Job, DailyJobSummary
+from jobs.services.csv_processing import CSVValidationError, iter_csv_rows
 
 class JobSerializer(serializers.ModelSerializer):
+    def validate_file(self, uploaded_file):
+        if not uploaded_file.name.lower().endswith(".csv"):
+            raise serializers.ValidationError("Upload a .csv file.")
+
+        try:
+            for _row in iter_csv_rows(uploaded_file):
+                pass
+        except CSVValidationError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+        return uploaded_file
+
     class Meta:
         model = Job
         fields = [

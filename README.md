@@ -68,7 +68,15 @@ Activate the backend virtual environment as above, then run:
 celery -A config worker --loglevel=info
 ```
 
-Celery Beat is only needed for scheduled daily summaries:
+Keep this worker running while submitting jobs. Redis stores queued jobs, but
+the worker is what actually reads and processes the uploaded CSV files. Running
+Celery Beat alone does not process jobs.
+
+Uploads must be comma-separated `.csv` files with a header row and UTF-8
+encoding. UTF-8 files with a BOM and Windows-style line endings are supported.
+
+Celery Beat is only needed for scheduled daily summaries and runs in a separate
+terminal:
 
 ```bash
 celery -A config beat --loglevel=info

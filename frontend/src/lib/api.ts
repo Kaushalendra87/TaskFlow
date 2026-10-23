@@ -143,8 +143,36 @@ class APIClient {
     return this.request<User>('/api/auth/me/');
   }
 
-  logout() {
+  async logout(): Promise<void> {
+    const refreshToken = this.refreshToken;
     this.clearTokens();
+
+    if (!refreshToken) {
+      return;
+    }
+
+    const response = await fetch(`${API_BASE_URL}/api/auth/logout/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh: refreshToken }),
+    });
+
+    if (!response.ok) {
+      let errorData: ErrorResponse = {
+        detail: 'Could not invalidate the server session',
+        code: 'logout_failed',
+      };
+      try {
+        errorData = await response.json();
+      } catch {
+        // Keep the default logout error.
+      }
+      throw new APIError(
+        errorData.detail || 'Could not invalidate the server session',
+        errorData.code || 'logout_failed',
+        response.status
+      );
+    }
   }
 
   // Jobs
@@ -227,9 +255,10 @@ class APIClient {
   }
 
   async cancelJob(id: number): Promise<Job> {
-    return this.request<Job>(`/api/jobs/${id}/cancel/`, {
+    const response = await this.request<{ job: Job }>(`/api/jobs/${id}/cancel/`, {
       method: 'POST',
     });
+    return response.job;
   }
 
   async getJobProgress(id: number): Promise<{
